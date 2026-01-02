@@ -292,6 +292,18 @@ def style_header(ws, row_num, num_cols):
         cell.alignment = Alignment(horizontal="center")
 
 
+def sanitize_for_excel(value):
+    """Remove illegal characters that Excel/openpyxl can't handle."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        # Remove control characters (ASCII 0-31 except tab, newline, carriage return)
+        import re
+        # Keep tab (9), newline (10), carriage return (13)
+        return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', value)
+    return value
+
+
 def add_dataframe_to_sheet(ws, df, start_row=1):
     if df.empty:
         ws.cell(row=start_row, column=1, value="No data")
@@ -303,8 +315,18 @@ def add_dataframe_to_sheet(ws, df, start_row=1):
     
     for row_idx, row in enumerate(df.itertuples(index=False), start_row + 1):
         for col_idx, value in enumerate(row, 1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
-            cell.alignment = Alignment(horizontal="center")
+            # Sanitize value before writing to Excel
+            clean_value = sanitize_for_excel(value)
+            try:
+                cell = ws.cell(row=row_idx, column=col_idx, value=clean_value)
+                cell.alignment = Alignment(horizontal="center")
+            except Exception as e:
+                # If still fails, convert to string and try again
+                try:
+                    cell = ws.cell(row=row_idx, column=col_idx, value=str(clean_value))
+                    cell.alignment = Alignment(horizontal="center")
+                except Exception:
+                    cell = ws.cell(row=row_idx, column=col_idx, value="[Error]")
     
     for col_idx, col_name in enumerate(df.columns, 1):
         try:
@@ -383,15 +405,16 @@ def generate_grant_excel_report(grant_data, report_month):
 # SLACK NOTIFICATION
 # =============================================================================
 
-def upload_file_to_slack(filepath, channel_id):
+def upload_file_to_slack(filepath, channel_id=None):
     """
     Upload a file to Slack using the new API flow (March 2025+).
     
-    Step 1: Get upload URL via files.getUploadURLExternal
-    Step 2: Upload file to the URL
-    Step 3: Complete upload via files.completeUploadExternal
+    If channel_id is provided, file is shared to that channel.
+    If channel_id is None, file is uploaded but not shared (returns file_id for later use).
+    
+    Returns: dict with 'file_id' and 'permalink' if successful, None otherwise
     """
-    if not SLACK_BOT_TOKEN or not channel_id:
+    if not SLACK_BOT_TOKEN:
         return None
     
     filename = os.path.basename(filepath)
@@ -426,31 +449,35 @@ def upload_file_to_slack(filepath, channel_id):
         print(f"Slack file upload failed: {upload_response.status_code}")
         return None
     
-    # Step 3: Complete upload
+    # Step 3: Complete upload (optionally share to channel)
     complete_url = "https://slack.com/api/files.completeUploadExternal"
+    
+    complete_payload = {
+        "files": [{"id": file_id, "title": filename}]
+    }
+    
+    # Only add channel_id if we want to share immediately
+    if channel_id:
+        complete_payload["channel_id"] = channel_id
+    
     complete_response = requests.post(
         complete_url,
         headers={
             "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
             "Content-Type": "application/json"
         },
-        json={
-            "files": [{"id": file_id, "title": filename}],
-            "channel_id": channel_id
-        }
+        json=complete_payload
     )
     
     if complete_response.status_code == 200:
         complete_result = complete_response.json()
         if complete_result.get("ok"):
-            # Get permalink from the response
             files = complete_result.get("files", [])
             if files:
                 permalink = files[0].get("permalink", "")
-                print(f"File uploaded to Slack successfully: {permalink}")
-                return permalink
-            print("File uploaded but no permalink returned")
-            return "uploaded"
+                print(f"File uploaded to Slack successfully: {filename}")
+                return {"file_id": file_id, "permalink": permalink}
+            return {"file_id": file_id, "permalink": None}
         else:
             print(f"Slack completeUploadExternal failed: {complete_result.get('error')}")
     else:
@@ -459,13 +486,22 @@ def upload_file_to_slack(filepath, channel_id):
     return None
 
 
-def send_slack_message_to_channel(blocks):
+def send_slack_message_to_channel(blocks, file_ids=None):
+    """
+    Send a message to a Slack channel, optionally with file attachments.
+    
+    file_ids: list of Slack file IDs to attach to the message
+    """
     if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
         return False
     
     url = "https://slack.com/api/chat.postMessage"
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}", "Content-Type": "application/json"}
     payload = {"channel": SLACK_CHANNEL_ID, "blocks": blocks}
+    
+    # Attach files if provided (comma-separated file IDs)
+    if file_ids:
+        payload["attachments"] = [{"file_ids": file_ids}]
     
     response = requests.post(url, headers=headers, json=payload)
     
@@ -496,7 +532,7 @@ def send_combined_slack_notification(kikoff_data, grant_data, report_month, kiko
     Send Slack message with combined report summary.
     
     Priority:
-    1. SLACK_BOT_TOKEN + SLACK_CHANNEL_ID → Send to channel with file uploads
+    1. SLACK_BOT_TOKEN + SLACK_CHANNEL_ID → Upload files, then send message with files attached
     2. Only SLACK_WEBHOOK_URL → Send to webhook (test mode, no files)
     """
     use_channel = bool(SLACK_BOT_TOKEN and SLACK_CHANNEL_ID)
@@ -505,18 +541,6 @@ def send_combined_slack_notification(kikoff_data, grant_data, report_month, kiko
     if not use_channel and not use_webhook:
         print("No Slack credentials configured. Skipping notification.")
         return
-    
-    kikoff_permalink = None
-    grant_permalink = None
-    
-    if use_channel:
-        print("Using Slack Bot Token - sending to channel...")
-        if kikoff_filepath:
-            kikoff_permalink = upload_file_to_slack(kikoff_filepath, SLACK_CHANNEL_ID)
-        if grant_filepath:
-            grant_permalink = upload_file_to_slack(grant_filepath, SLACK_CHANNEL_ID)
-    else:
-        print("Using Slack Webhook - sending to webhook (test mode)...")
     
     # Build summaries
     kikoff_summary = kikoff_data["summary"]
@@ -550,23 +574,34 @@ def send_combined_slack_notification(kikoff_data, grant_data, report_month, kiko
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*GRANT CASH ADVANCE* (`{GRANT_EVENT_NAME}`)\n• Delivered: *{grant_delivered:,}*\n• Fraud (P360): *{grant_fraud:,}* ({grant_fraud_rate:.1f}%)\n• Add'l Fraud: *{grant_addl_fraud:,}* ({grant_addl_fraud_rate:.1f}%)\n• Net Valid: *{grant_net_valid:,}*"}}
     ]
     
-    if use_channel and (kikoff_permalink or grant_permalink):
-        download_text = "📎 *Download Reports:*\n"
-        if kikoff_permalink:
-            download_text += f"• <{kikoff_permalink}|Kikoff Report>\n"
-        if grant_permalink:
-            download_text += f"• <{grant_permalink}|Grant Report>"
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": download_text}})
-    elif use_webhook:
+    if use_channel:
+        print("Using Slack Bot Token - sending to channel...")
+        
+        # Upload files first (without sharing to channel yet)
+        file_ids = []
+        
+        if kikoff_filepath:
+            result = upload_file_to_slack(kikoff_filepath)  # No channel_id
+            if result and result.get("file_id"):
+                file_ids.append(result["file_id"])
+        
+        if grant_filepath:
+            result = upload_file_to_slack(grant_filepath)  # No channel_id
+            if result and result.get("file_id"):
+                file_ids.append(result["file_id"])
+        
+        # Send message with files attached
+        if file_ids:
+            send_slack_message_to_channel(blocks, file_ids=file_ids)
+        else:
+            send_slack_message_to_channel(blocks)
+    else:
+        print("Using Slack Webhook - sending to webhook (test mode)...")
         github_repo = os.environ.get("GITHUB_REPOSITORY", "")
         github_run_id = os.environ.get("GITHUB_RUN_ID", "")
         if github_repo and github_run_id:
             artifact_url = f"https://github.com/{github_repo}/actions/runs/{github_run_id}"
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"📎 <{artifact_url}|Download Reports> (requires GitHub access)\n_[Test mode - using webhook]_"}})
-    
-    if use_channel:
-        send_slack_message_to_channel(blocks)
-    else:
         send_slack_message_to_webhook(blocks)
 
 
