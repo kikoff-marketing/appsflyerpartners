@@ -405,12 +405,12 @@ def generate_grant_excel_report(grant_data, report_month):
 # SLACK NOTIFICATION
 # =============================================================================
 
-def upload_file_to_slack(filepath, channel_id=None):
+def upload_file_to_slack(filepath, channel_id=None, thread_ts=None):
     """
     Upload a file to Slack using the new API flow (March 2025+).
     
     If channel_id is provided, file is shared to that channel.
-    If channel_id is None, file is uploaded but not shared (returns file_id for later use).
+    If thread_ts is also provided, file is shared as a thread reply.
     
     Returns: dict with 'file_id' and 'permalink' if successful, None otherwise
     """
@@ -449,16 +449,20 @@ def upload_file_to_slack(filepath, channel_id=None):
         print(f"Slack file upload failed: {upload_response.status_code}")
         return None
     
-    # Step 3: Complete upload (optionally share to channel)
+    # Step 3: Complete upload (optionally share to channel/thread)
     complete_url = "https://slack.com/api/files.completeUploadExternal"
     
     complete_payload = {
         "files": [{"id": file_id, "title": filename}]
     }
     
-    # Only add channel_id if we want to share immediately
+    # Add channel_id to share the file
     if channel_id:
         complete_payload["channel_id"] = channel_id
+        
+        # Add thread_ts to post as a reply
+        if thread_ts:
+            complete_payload["thread_ts"] = thread_ts
     
     complete_response = requests.post(
         complete_url,
@@ -486,31 +490,30 @@ def upload_file_to_slack(filepath, channel_id=None):
     return None
 
 
-def send_slack_message_to_channel(blocks, file_ids=None):
+def send_slack_message_to_channel(blocks):
     """
-    Send a message to a Slack channel, optionally with file attachments.
-    
-    file_ids: list of Slack file IDs to attach to the message
+    Send a message to a Slack channel using the Bot Token.
+    Returns the message timestamp (ts) for threading, or None if failed.
     """
     if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
-        return False
+        return None
     
     url = "https://slack.com/api/chat.postMessage"
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}", "Content-Type": "application/json"}
     payload = {"channel": SLACK_CHANNEL_ID, "blocks": blocks}
     
-    # Attach files if provided (comma-separated file IDs)
-    if file_ids:
-        payload["attachments"] = [{"file_ids": file_ids}]
-    
     response = requests.post(url, headers=headers, json=payload)
     
-    if response.status_code == 200 and response.json().get("ok"):
-        print("Slack message sent to channel successfully")
-        return True
+    if response.status_code == 200:
+        result = response.json()
+        if result.get("ok"):
+            print("Slack message sent to channel successfully")
+            return result.get("ts")  # Return timestamp for threading
+        else:
+            print(f"Slack channel message failed: {result.get('error')}")
     else:
-        print(f"Slack channel message failed: {response.json().get('error', response.status_code)}")
-        return False
+        print(f"Slack channel message failed: {response.status_code}")
+    return None
 
 
 def send_slack_message_to_webhook(blocks):
@@ -532,7 +535,7 @@ def send_combined_slack_notification(kikoff_data, grant_data, report_month, kiko
     Send Slack message with combined report summary.
     
     Priority:
-    1. SLACK_BOT_TOKEN + SLACK_CHANNEL_ID → Upload files, then send message with files attached
+    1. SLACK_BOT_TOKEN + SLACK_CHANNEL_ID → Send summary message, then upload files as thread replies
     2. Only SLACK_WEBHOOK_URL → Send to webhook (test mode, no files)
     """
     use_channel = bool(SLACK_BOT_TOKEN and SLACK_CHANNEL_ID)
@@ -577,24 +580,24 @@ def send_combined_slack_notification(kikoff_data, grant_data, report_month, kiko
     if use_channel:
         print("Using Slack Bot Token - sending to channel...")
         
-        # Upload files first (without sharing to channel yet)
-        file_ids = []
+        # Add note about files in thread
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "📎 _Excel reports attached in thread_"}]})
         
-        if kikoff_filepath:
-            result = upload_file_to_slack(kikoff_filepath)  # No channel_id
-            if result and result.get("file_id"):
-                file_ids.append(result["file_id"])
+        # Send summary message first and get the timestamp for threading
+        message_ts = send_slack_message_to_channel(blocks)
         
-        if grant_filepath:
-            result = upload_file_to_slack(grant_filepath)  # No channel_id
-            if result and result.get("file_id"):
-                file_ids.append(result["file_id"])
-        
-        # Send message with files attached
-        if file_ids:
-            send_slack_message_to_channel(blocks, file_ids=file_ids)
+        # Upload files as thread replies
+        if message_ts:
+            if kikoff_filepath:
+                upload_file_to_slack(kikoff_filepath, SLACK_CHANNEL_ID, thread_ts=message_ts)
+            if grant_filepath:
+                upload_file_to_slack(grant_filepath, SLACK_CHANNEL_ID, thread_ts=message_ts)
         else:
-            send_slack_message_to_channel(blocks)
+            # Fallback: upload without threading if message failed
+            if kikoff_filepath:
+                upload_file_to_slack(kikoff_filepath, SLACK_CHANNEL_ID)
+            if grant_filepath:
+                upload_file_to_slack(grant_filepath, SLACK_CHANNEL_ID)
     else:
         print("Using Slack Webhook - sending to webhook (test mode)...")
         github_repo = os.environ.get("GITHUB_REPOSITORY", "")
