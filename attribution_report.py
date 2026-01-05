@@ -257,6 +257,90 @@ def apply_grant_addl_fraud_rules(df, fraud_df):
     return addl_fraud_df
 
 
+def apply_grant_outside_attribution_rules(df, fraud_df):
+    """
+    Apply Grant-specific outside attribution rules.
+    
+    Rules - flag events where:
+    1. Attributed touch type is "impression" (any VTA)
+    OR
+    2. Attribution lookback is greater than 7 days (for clicks)
+    
+    Also excludes events already in P360 fraud data.
+    
+    Returns:
+        DataFrame of flagged events (Outside Attribution)
+    """
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Normalize column names
+    df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+    
+    # Identify touch type column
+    touch_type_col = next((col for col in ['attributed_touch_type', 'touch_type'] if col in df.columns), None)
+    if touch_type_col:
+        df["touch_type_normalized"] = df[touch_type_col].fillna("").str.strip().str.lower()
+    else:
+        print("Warning: Could not find touch type column for Grant Outside Attribution check.")
+        df["touch_type_normalized"] = "unknown"
+    
+    # Identify lookback column
+    lookback_col = next((col for col in ['attribution_lookback', 'lookback', 'time_to_install'] if col in df.columns), None)
+    if lookback_col:
+        df["lookback_hours"] = df[lookback_col].apply(parse_lookback_to_hours)
+    else:
+        print("Warning: Could not find lookback column for Grant Outside Attribution check.")
+        df["lookback_hours"] = 0
+    
+    # Rule 1: Any impression (VTA)
+    mask_impression = df["touch_type_normalized"] == "impression"
+    
+    # Rule 2: Click with lookback > 7 days (168 hours)
+    mask_click_window = (df["touch_type_normalized"] == "click") & (df["lookback_hours"] > 7 * 24)
+    
+    # Combine rules with OR
+    outside_attr_mask = mask_impression | mask_click_window
+    
+    outside_attr_df = df[outside_attr_mask].copy()
+    
+    # Add flag reason
+    outside_attr_df["flag_reason"] = ""
+    outside_attr_df.loc[outside_attr_df["touch_type_normalized"] == "impression", "flag_reason"] = "VTA (Impression)"
+    outside_attr_df.loc[
+        (outside_attr_df["touch_type_normalized"] == "click") & (outside_attr_df["lookback_hours"] > 7 * 24), 
+        "flag_reason"
+    ] = "CTA Window Exceeded (>7d)"
+    
+    print(f"Outside Attribution events (before dedup): {len(outside_attr_df)}")
+    
+    if outside_attr_df.empty:
+        return pd.DataFrame()
+    
+    # Remove events already in P360 fraud data
+    if not fraud_df.empty:
+        fraud_df.columns = fraud_df.columns.str.strip().str.lower().str.replace(' ', '_')
+        
+        customer_id_col = next((col for col in outside_attr_df.columns if 'customer' in col and 'id' in col), None)
+        appsflyer_id_col = next((col for col in outside_attr_df.columns if 'appsflyer' in col and 'id' in col), None)
+        
+        if customer_id_col and appsflyer_id_col:
+            outside_attr_df["_match_key"] = outside_attr_df[customer_id_col].astype(str) + "_" + outside_attr_df[appsflyer_id_col].astype(str)
+            fraud_df["_match_key"] = fraud_df[customer_id_col].astype(str) + "_" + fraud_df[appsflyer_id_col].astype(str)
+            
+            fraud_keys = set(fraud_df["_match_key"].unique())
+            outside_attr_df = outside_attr_df[~outside_attr_df["_match_key"].isin(fraud_keys)]
+            outside_attr_df = outside_attr_df.drop(columns=["_match_key"], errors='ignore')
+            
+            print(f"Outside Attribution events (after dedup): {len(outside_attr_df)}")
+    
+    # Normalize agency column for aggregation
+    agency_col = next((col for col in ['agency', 'partner', 'af_prt', 'media_source'] if col in outside_attr_df.columns), None)
+    outside_attr_df["agency_normalized"] = outside_attr_df[agency_col].fillna("unknown").str.strip().str.lower() if agency_col else "unknown"
+    
+    return outside_attr_df
+
+
 # =============================================================================
 # AGGREGATION
 # =============================================================================
@@ -375,7 +459,7 @@ def generate_grant_excel_report(grant_data, report_month):
     
     grant_summary = grant_data["summary"].copy() if not grant_data["summary"].empty else pd.DataFrame()
     if not grant_summary.empty:
-        desired_order = ["agency", "delivered", "fraud", "fraud_rate_%", "addl_fraud", "addl_fraud_rate_%", "net_valid"]
+        desired_order = ["agency", "delivered", "fraud", "fraud_rate_%", "addl_fraud", "addl_fraud_rate_%", "outside_attribution", "outside_attr_rate_%", "net_valid"]
         final_order = [col for col in desired_order if col in grant_summary.columns]
         final_order.extend([col for col in grant_summary.columns if col not in final_order])
         grant_summary = grant_summary[final_order]
@@ -383,7 +467,7 @@ def generate_grant_excel_report(grant_data, report_month):
     ws = wb.create_sheet("Summary")
     ws.cell(row=1, column=1, value=f"Grant Cash Advance Attribution Report - {report_month}")
     ws.cell(row=1, column=1).font = Font(bold=True, size=14)
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=7)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=9)
     add_dataframe_to_sheet(ws, grant_summary, start_row=3)
     
     ws = wb.create_sheet("Delivered Events")
@@ -393,7 +477,10 @@ def generate_grant_excel_report(grant_data, report_month):
     add_dataframe_to_sheet(ws, grant_data["fraud"])
     
     ws = wb.create_sheet("Add'l Fraud Events")
-    add_dataframe_to_sheet(ws, grant_data["flagged"])
+    add_dataframe_to_sheet(ws, grant_data.get("addl_fraud", pd.DataFrame()))
+    
+    ws = wb.create_sheet("Outside Attribution Events")
+    add_dataframe_to_sheet(ws, grant_data.get("outside_attr", pd.DataFrame()))
     
     filepath = f"/tmp/Appsflyer_Grant_{get_report_month_yyyymm()}.xlsx"
     wb.save(filepath)
@@ -563,18 +650,20 @@ def send_combined_slack_notification(kikoff_data, grant_data, report_month, kiko
         grant_delivered = int(grant_summary["delivered"].sum())
         grant_fraud = int(grant_summary["fraud"].sum())
         grant_addl_fraud = int(grant_summary["addl_fraud"].sum()) if "addl_fraud" in grant_summary.columns else 0
+        grant_outside_attr = int(grant_summary["outside_attribution"].sum()) if "outside_attribution" in grant_summary.columns else 0
         grant_net_valid = int(grant_summary["net_valid"].sum())
         grant_fraud_rate = (grant_fraud / grant_delivered * 100) if grant_delivered > 0 else 0
         grant_addl_fraud_rate = (grant_addl_fraud / grant_delivered * 100) if grant_delivered > 0 else 0
+        grant_outside_attr_rate = (grant_outside_attr / grant_delivered * 100) if grant_delivered > 0 else 0
     else:
-        grant_delivered = grant_fraud = grant_addl_fraud = grant_net_valid = 0
-        grant_fraud_rate = grant_addl_fraud_rate = 0
+        grant_delivered = grant_fraud = grant_addl_fraud = grant_outside_attr = grant_net_valid = 0
+        grant_fraud_rate = grant_addl_fraud_rate = grant_outside_attr_rate = 0
     
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": f"📊 Monthly AppsFlyer Partner Report — {report_month}", "emoji": True}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*KIKOFF* (`{KIKOFF_EVENT_NAME}`)\n• Delivered: *{kikoff_delivered:,}*\n• Fraud (P360): *{kikoff_fraud:,}* ({kikoff_fraud_rate:.1f}%)\n• Outside Attribution: *{kikoff_outside_attr:,}* ({kikoff_outside_attr_rate:.1f}%)\n• Net Valid: *{kikoff_net_valid:,}*"}},
         {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*GRANT CASH ADVANCE* (`{GRANT_EVENT_NAME}`)\n• Delivered: *{grant_delivered:,}*\n• Fraud (P360): *{grant_fraud:,}* ({grant_fraud_rate:.1f}%)\n• Add'l Fraud: *{grant_addl_fraud:,}* ({grant_addl_fraud_rate:.1f}%)\n• Net Valid: *{grant_net_valid:,}*"}}
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*GRANT CASH ADVANCE* (`{GRANT_EVENT_NAME}`)\n• Delivered: *{grant_delivered:,}*\n• Fraud (P360): *{grant_fraud:,}* ({grant_fraud_rate:.1f}%)\n• Add'l Fraud: *{grant_addl_fraud:,}* ({grant_addl_fraud_rate:.1f}%)\n• Outside Attribution: *{grant_outside_attr:,}* ({grant_outside_attr_rate:.1f}%)\n• Net Valid: *{grant_net_valid:,}*"}}
     ]
     
     if use_channel:
@@ -704,8 +793,15 @@ def process_grant_app(from_date, to_date):
     print("Applying Add'l Fraud Rules")
     print("-" * 40)
     
-    addl_fraud_df = apply_grant_addl_fraud_rules(delivered_df, fraud_df)
+    addl_fraud_df = apply_grant_addl_fraud_rules(delivered_df.copy(), fraud_df.copy())
     print(f"Add'l Fraud events: {len(addl_fraud_df)}")
+    
+    print("\n" + "-" * 40)
+    print("Applying Outside Attribution Rules")
+    print("-" * 40)
+    
+    outside_attr_df = apply_grant_outside_attribution_rules(delivered_df.copy(), fraud_df.copy())
+    print(f"Outside Attribution events: {len(outside_attr_df)}")
     
     # Normalize and filter excluded agencies
     if not delivered_df.empty:
@@ -734,6 +830,12 @@ def process_grant_app(from_date, to_date):
         addl_fraud_df = addl_fraud_df[addl_fraud_df["agency_normalized"].notna()]
         print(f"Add'l Fraud events after filtering excluded agencies: {len(addl_fraud_df)} (removed {before_count - len(addl_fraud_df)})")
     
+    if not outside_attr_df.empty:
+        before_count = len(outside_attr_df)
+        outside_attr_df = outside_attr_df[~outside_attr_df["agency_normalized"].isin(GRANT_EXCLUDED_AGENCIES)]
+        outside_attr_df = outside_attr_df[outside_attr_df["agency_normalized"].notna()]
+        print(f"Outside Attribution events after filtering excluded agencies: {len(outside_attr_df)} (removed {before_count - len(outside_attr_df)})")
+    
     print("\n" + "-" * 40)
     print("Aggregating by Agency")
     print("-" * 40)
@@ -741,23 +843,26 @@ def process_grant_app(from_date, to_date):
     delivered_agg = aggregate_by_agency(delivered_df, "delivered")
     fraud_agg = aggregate_by_agency(fraud_df, "fraud")
     addl_fraud_agg = aggregate_by_agency(addl_fraud_df, "addl_fraud")
+    outside_attr_agg = aggregate_by_agency(outside_attr_df, "outside_attribution")
     
     if delivered_agg.empty:
-        summary_df = pd.DataFrame(columns=["agency", "delivered", "fraud", "addl_fraud", "fraud_rate_%", "addl_fraud_rate_%", "net_valid"])
+        summary_df = pd.DataFrame(columns=["agency", "delivered", "fraud", "fraud_rate_%", "addl_fraud", "addl_fraud_rate_%", "outside_attribution", "outside_attr_rate_%", "net_valid"])
     else:
         summary_df = delivered_agg.copy()
         summary_df = summary_df.merge(fraud_agg, on="agency", how="left") if not fraud_agg.empty else summary_df.assign(fraud=0)
         summary_df = summary_df.merge(addl_fraud_agg[["agency", "addl_fraud"]], on="agency", how="left") if not addl_fraud_agg.empty else summary_df.assign(addl_fraud=0)
+        summary_df = summary_df.merge(outside_attr_agg[["agency", "outside_attribution"]], on="agency", how="left") if not outside_attr_agg.empty else summary_df.assign(outside_attribution=0)
         summary_df = summary_df.fillna(0)
         
-        for col in ["delivered", "fraud", "addl_fraud"]:
+        for col in ["delivered", "fraud", "addl_fraud", "outside_attribution"]:
             summary_df[col] = pd.to_numeric(summary_df[col], errors='coerce').fillna(0)
         
-        summary_df["net_valid"] = (summary_df["delivered"] - summary_df["fraud"] - summary_df["addl_fraud"]).astype(int)
+        summary_df["net_valid"] = (summary_df["delivered"] - summary_df["fraud"] - summary_df["addl_fraud"] - summary_df["outside_attribution"]).astype(int)
         summary_df["fraud_rate_%"] = summary_df.apply(lambda row: round(row["fraud"] / row["delivered"] * 100, 1) if row["delivered"] > 0 else 0, axis=1)
         summary_df["addl_fraud_rate_%"] = summary_df.apply(lambda row: round(row["addl_fraud"] / row["delivered"] * 100, 1) if row["delivered"] > 0 else 0, axis=1)
+        summary_df["outside_attr_rate_%"] = summary_df.apply(lambda row: round(row["outside_attribution"] / row["delivered"] * 100, 1) if row["delivered"] > 0 else 0, axis=1)
         
-        for col in ["delivered", "fraud", "addl_fraud", "net_valid"]:
+        for col in ["delivered", "fraud", "addl_fraud", "outside_attribution", "net_valid"]:
             summary_df[col] = summary_df[col].astype(int)
         
         summary_df = summary_df.sort_values("delivered", ascending=False)
@@ -766,7 +871,7 @@ def process_grant_app(from_date, to_date):
     if not summary_df.empty:
         print(summary_df.to_string(index=False))
     
-    return {"summary": summary_df, "delivered": delivered_df, "fraud": fraud_df, "flagged": addl_fraud_df}
+    return {"summary": summary_df, "delivered": delivered_df, "fraud": fraud_df, "addl_fraud": addl_fraud_df, "outside_attr": outside_attr_df}
 
 
 def main():
