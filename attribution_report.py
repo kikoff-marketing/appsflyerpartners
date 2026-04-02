@@ -127,6 +127,9 @@ def pull_appsflyer_report(app_id, report_type, from_date, to_date, event_name):
     
     response = requests.get(url, headers=headers, params=params)
     
+    if response.status_code == 401:
+        raise SystemExit("ERROR: 401 Unauthorized from AppsFlyer API. Check APPSFLYER_API_TOKEN and try again.")
+
     if response.status_code != 200:
         print(f"  Error: {response.status_code}")
         print(f"  Response: {response.text[:500] if response.text else 'Empty'}")
